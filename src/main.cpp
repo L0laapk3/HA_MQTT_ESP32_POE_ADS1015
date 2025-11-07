@@ -136,7 +136,7 @@ struct AnalogInput : Input<float> {
 	}
 
 	static constexpr int ADC_MAX = 4095; // 12-bit ADC on ESP32
-	static constexpr float HYSTERESIS_PERCENT = 0.25;
+	static constexpr float HYSTERESIS_PERCENT = .75f;
 
 	std::array<uint32_t, 4> samples{ 0 };
 	static constexpr size_t SAMPLES_PER_READ = 16;
