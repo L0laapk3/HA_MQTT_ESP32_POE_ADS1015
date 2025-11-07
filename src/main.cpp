@@ -11,6 +11,7 @@
 #include <string>
 #include <sstream>
 #include <iomanip>
+#include "driver/adc.h"
 
 
 #define USE_WIFI false
@@ -31,10 +32,11 @@ std::string MQTT_HA_DISCOVERY_PREFIX = "homeassistant";
 
 // Matrix scanning configuration
 // 2 rows (driver pins) x 3 columns (input pins) = 6 switches
-constexpr std::array<uint8_t, 2> MATRIX_DRIVER_PINS = {4, 14};  // Driver pins - outputs
+constexpr std::array<uint8_t, 2> MATRIX_DRIVER_PINS = {4, 14};  // Drive r pins - outputs
 constexpr std::array<uint8_t, 4> MATRIX_INPUT_PINS = {13, 32, 15, 3};  // Input pins - inputs with pullup
-constexpr uint8_t ANALOG_PIN = 36;  // Analog input pin
+constexpr uint8_t ANALOG_PIN = 35;  // Analog input pin
 constexpr uint8_t ANALOG_BUTTON_PIN = 5; // pullup
+constexpr adc1_channel_t ANALOG_CHANNEL = adc1_channel_t::ADC1_CHANNEL_0;
 
 #if USE_WIFI
 WiFiClient wifiClient;
@@ -60,28 +62,43 @@ struct Input {
 
 	HAMqttDevice device;
 	uint8_t pin;
-	std::optional<T> boolState, lastBoolState;
-
 	std::string topic;
+	std::optional<T> state, lastState;
+	static constexpr unsigned long UPDATE_MIN_INTERVAL = 50;
+	unsigned long lastUpdateTime = 0;
 
 	void publishDiscovery() {
 		mqtt.publish(device.getConfigTopic().c_str(), device.getConfigPayload().c_str(), true);
 	}
 
-	virtual void read() = 0;
+protected:
+	virtual std::optional<T> read() = 0;
+	virtual void changed() { };
+	virtual std::string getPayload() = 0;
 
-	virtual void publish() = 0;
-	void mqtt_publish(std::string_view payload) {
+	virtual bool shouldUpdate() {
+		if (!state.has_value())
+			return false;
+		if (lastState.has_value())
+			if (state.value() == lastState.value())
+				return false;
+		return millis() - lastUpdateTime >= UPDATE_MIN_INTERVAL;
+	}
+
+public:
+	void update() {
+		state = read();
+		if (!shouldUpdate())
+			return;
+		lastState = state;
+		lastUpdateTime = millis();
+
+		auto payload = getPayload();
 		Serial.print("Topic ");
 		Serial.print(topic.c_str());
 		Serial.print("\tPayload ");
-		Serial.println(payload.data());
-		mqtt.publish(topic.c_str(), payload.data(), true);
-	}
-
-	void update() {
-		read();
-		publish();
+		Serial.println(payload.c_str());
+		mqtt.publish(topic.c_str(), payload.c_str(), true);
 	}
 };
 
@@ -93,29 +110,17 @@ struct DigitalInput : public Input<bool> {
 		pinMode(pin, INPUT_PULLUP);
 	}
 
-	static constexpr unsigned long DEBOUNCE_DELAY_MS = 100;
-	unsigned long lastChangeTime = 0;
-
-	void read() override {
-		boolState = !digitalRead(pin);
-		if (millis() - lastChangeTime >= DEBOUNCE_DELAY_MS) {
-			if (boolState != lastBoolState)
-				lastChangeTime = millis();
-		}
+	std::string getPayload() override {
+		return state.value() ? "1" : "0";
 	}
 
-	void publish() override {
-		if (!lastBoolState.has_value() || boolState != lastBoolState) {
-			lastBoolState = boolState;
-			mqtt_publish(boolState.value() ? "1" : "0");
-		}
+	std::optional<bool> read() override {
+		return !digitalRead(pin);
 	}
 };
 
 
 struct AnalogInput : Input<float> {
-	std::optional<float> floatState, lastFloatState;
-
 	AnalogInput(std::string topic, std::string name, uint8_t pin)
 		: Input(topic, name, pin, HAMqttDevice::SENSOR) {
 		device.addConfigVar("unit_of_measurement", "%");
@@ -124,21 +129,46 @@ struct AnalogInput : Input<float> {
 		pinMode(pin, INPUT);
 	}
 
+	std::string getPayload() override {
+		std::ostringstream oss;
+		oss << std::fixed << std::setprecision(1) << state.value();
+		return oss.str();
+	}
+
 	static constexpr int ADC_MAX = 4095; // 12-bit ADC on ESP32
 	static constexpr float HYSTERESIS_PERCENT = 0.25;
 
-	void read() override {
-		int analogValue = analogRead(pin);
-		floatState = (analogValue / float(ADC_MAX)) * 100.0f;
+	std::array<uint32_t, 4> samples{ 0 };
+	static constexpr size_t SAMPLES_PER_READ = 16;
+	size_t sampleIndex = 0;
+	uint64_t sampleSum = 0;
+
+	std::optional<float> read() override {
+		sampleSum -= samples[sampleIndex];
+		samples[sampleIndex] = 0;
+		for (int i = 0; i < SAMPLES_PER_READ; ++i)
+			samples[sampleIndex] += analogRead(pin);
+		sampleSum += samples[sampleIndex];
+		if (++sampleIndex >= samples.size())
+			sampleIndex = 0;
+		else if (!state.has_value())
+			return std::nullopt; // wait until buffer is full
+		auto result = (sampleSum / float(samples.size() * SAMPLES_PER_READ * ADC_MAX)) * 100.0f;
+		if (result < HYSTERESIS_PERCENT)
+			return 0.0f;
+		else if (result > 100.0f - HYSTERESIS_PERCENT)
+			return 100.0f;
+		return result;
 	}
 
-	void publish() override {
-		if (!lastFloatState.has_value() || abs(floatState.value() - lastFloatState.value()) > HYSTERESIS_PERCENT) {
-			lastFloatState = floatState;
-			std::ostringstream oss;
-			oss << std::fixed << std::setprecision(1) << floatState.value();
-			mqtt_publish(oss.str());
-		}
+	bool shouldUpdate() override {
+		if (!Input<float>::shouldUpdate())
+			return false;
+		if (!lastState.has_value())
+			return true;
+		if (state.value() == 0 || state.value() == 100)
+			return true;
+		return std::abs(state.value() - lastState.value()) >= HYSTERESIS_PERCENT;
 	}
 };
 
@@ -243,7 +273,8 @@ void setup() {
 	for (auto pin : MATRIX_DRIVER_PINS) {
 		pinMode(pin, INPUT); // float
 	}
-
+	adc1_config_channel_atten(ANALOG_CHANNEL, ADC_ATTEN_DB_12);
+	adc_set_clk_div(255);
 
 	mqtt.setServer(mqtt_server.c_str(), mqtt_port);
 	mqtt.setBufferSize(2048);
